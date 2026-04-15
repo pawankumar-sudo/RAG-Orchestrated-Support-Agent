@@ -9,9 +9,10 @@ The user treats this repo state as the **last known-good production behavior** f
 
 ## When the user asks to revert / go back / restore the safe version
 
-1. **If git is initialized** (recommended): restore the tagged checkpoint:
-   - `git checkout stable-it-help-2026-04-13`
-   - or `git reset --hard stable-it-help-2026-04-13` only if they explicitly want to discard all uncommitted work after that tag.
+1. **Git tag (this repo):** `stable-it-help-2026-04-13` points at the known-good tree (same app behavior; `node_modules` is not tracked — run `npm install` if you use the JS helper).
+   - Inspect: `git show stable-it-help-2026-04-13`
+   - Restore working tree to tag: `git checkout stable-it-help-2026-04-13`
+   - Discard all later commits and match tag exactly: `git reset --hard stable-it-help-2026-04-13` (only when they want to throw away everything after the tag).
 
 2. **If no git tag exists yet**: ask them to use their own backup, or re-init from the last zip/export they trust.
 
