@@ -1,0 +1,27 @@
+---
+description: Known-good baseline for IT Help Slack app; revert target when experiments break
+alwaysApply: true
+---
+
+# Stable baseline checkpoint (2026-04-13)
+
+The user treats this repo state as the **last known-good production behavior** for the Slack IT Help app (notably `index.py` + `local.py`).
+
+## When the user asks to revert / go back / restore the safe version
+
+1. **If git is initialized** (recommended): restore the tagged checkpoint:
+   - `git checkout stable-it-help-2026-04-13`
+   - or `git reset --hard stable-it-help-2026-04-13` only if they explicitly want to discard all uncommitted work after that tag.
+
+2. **If no git tag exists yet**: ask them to use their own backup, or re-init from the last zip/export they trust.
+
+## What this baseline roughly includes (do not remove lightly)
+
+- Confluence KB search (AI keywords, CQL, ranking, optional article pick).
+- KB answers as **summaries** + link; `summary_source` for full-enough text to `summarize_kb`.
+- **AI grounding**: Confluence excerpts when relevance passes `AI_GROUNDING_MIN_TOP_SCORE`; otherwise **general IT** mode with same `enforce_security_policy` redaction.
+- DM threads, need-more-help flow, `/it help`, security redaction patterns.
+
+## Future work (semantic search, etc.)
+
+If new features cause regressions, **revert to this checkpoint first**, then re-apply changes in smaller steps.
