@@ -51,6 +51,139 @@ private IT channel.
 
 ---
 
+## AI Engineering & RAG Design Decisions
+
+This section captures *why* the bot behaves the way it does — the design
+choices behind the AI pipeline, not just the mechanics. Every piece of the
+system was built with production-grade LLM engineering principles in mind:
+retrieval quality, grounding, hallucination control, cost/latency budgets,
+and debuggability.
+
+### Hybrid retrieval (classical search + LLM re-ranking)
+
+Pure vector search is overkill for a curated internal KB; pure keyword search
+over-indexes on noisy tokens. The pipeline therefore combines three stages
+that each play to their strengths:
+
+1. **Deterministic CQL search** (strict `AND` → `OR` fallback) for broad recall
+   across Confluence.
+2. **A hand-tuned composite scoring function** that blends anchor-term overlap,
+   title-alignment boosts, bigram phrase matching, how-to-signal detection, and
+   product-name-in-title heuristics — with explicit penalties for hub /
+   overview / announcement pages on troubleshooting intent.
+3. **LLM-as-judge re-ranking** (`_ai_pick_best_kb_index`) — Gemini picks the
+   single best article *only* among the top candidates. Semantic understanding
+   is used where it moves the needle, not across the whole corpus.
+
+This is the same "lexical retrieval + LLM re-ranker" pattern used by
+production RAG stacks at scale. It keeps per-query cost and latency
+predictable while still benefiting from semantic understanding at the point
+of ambiguity.
+
+### Retrieval-Augmented Generation with hard grounding
+
+`AI_KB_GROUNDING` forces Gemini to synthesize answers from Confluence
+excerpts rather than its parametric memory. The grounding block is injected
+into the system prompt with explicit contracts:
+
+- Treat KB excerpts as authoritative for procedures, tool names, and company
+  policy.
+- **Do not** fabricate citations, company URLs, product rollouts, or policies
+  absent from the excerpts.
+- When no KB page clears `AI_GROUNDING_MIN_TOP_SCORE`, fall through to a
+  clearly-labeled "general guidance" branch with a different system-prompt
+  appendix — so users see up-front when they're outside the KB.
+
+This is a deliberate mitigation for the two classic failure modes of
+enterprise LLM assistants: (a) hallucinating plausible-looking steps that
+don't match the company's actual stack, and (b) blending public internet
+knowledge with company-specific workflows without the user realising it.
+
+### Task-specialized prompting & temperature control
+
+Rather than reusing one system prompt everywhere, every LLM call is tuned to
+its job:
+
+| Task | Temperature | Max tokens | Rationale |
+|---|---|---|---|
+| Keyword extraction | 0.1 | 256 | Deterministic structured output |
+| Candidate re-ranking | 0.1 | 32 | Single-integer classification — no generation needed |
+| KB → runbook summary | 0.25 | 2800 | Faithful rewriting, minimal drift from source |
+| Multi-turn IT chat | 0.35 | 1800 | Natural conversational tone, bounded creativity |
+
+Prompt scaffolding encodes voice rules (senior L2 engineer), format
+constraints (Slack `mrkdwn`, no tables, no `##` headings), and a security
+policy (user-level steps only; escalate admin work). The KB-grounded and
+no-KB branches each get their own system-prompt appendix, so behaviour
+switches are **explicit, not implicit** — no hidden mode changes.
+
+### Hallucination mitigation in output
+
+Grounding alone isn't enough — model output is post-processed before it ever
+reaches Slack:
+
+- `strip_citation_tokens` removes `KB[1]`, `[4]`, `(source: 2)`, `ref[1]` and
+  similar artifacts that models leak even when explicitly told not to emit
+  them.
+- `redact_sensitive_instructions` enforces a **privilege policy over generated
+  text**: admin-only commands (registry edits, PowerShell, `sudo`, BIOS, GPO,
+  disabling security tooling) are masked into a `ticket` placeholder.
+- `_line_or_paragraph_sensitive` operates paragraph-by-paragraph so the bot
+  returns the *safe* half of a mixed-guidance article instead of refusing
+  outright — users still get value from partial answers.
+
+### Conversation memory & context-window management
+
+`trim_history` keeps the last four user/bot turns verbatim and compresses
+older turns into a 300-character rolling summary, which is re-injected as a
+synthetic user/model pair. This caps input tokens on long-running threads
+without losing the conversational gist — the same context-compression
+technique used by modern agentic LLM frameworks.
+
+### Reliability engineering for LLM calls
+
+`gemini_generate` wraps every model call with:
+
+- **Backoff classified by exception signature** — `429` / `resource exhausted`
+  gets longer delays than transient `5xx` / `read timed out`, because quota
+  errors need cool-down and network blips don't.
+- **Per-task retry budgets** — the re-ranker retries less aggressively than
+  the KB summary call, because summary failures are more user-visible.
+- **Graceful degradation** — failure paths fall back to truncated raw KB
+  content or a clear ticket-creation prompt instead of an empty reply.
+
+### Latency & cost controls
+
+- KB summaries are cached for one hour by
+  `sha256(title + normalized_query + sha256(body))` with soft-LRU eviction,
+  so follow-up questions in the same thread never re-hit the model.
+- The re-ranking prompt is capped at `KB_AI_PICK_MAX_CANDIDATES=12` and
+  produces a 32-token output — it's a routing decision, not a generation
+  task, and is priced accordingly.
+- Grounding excerpts are budgeted (`AI_GROUNDING_PER_PAGE_CHARS`,
+  `AI_GROUNDING_TOTAL_CHARS`) so input length stays bounded regardless of
+  KB page size, preventing runaway token costs on long Confluence articles.
+
+### Evaluation hooks & debuggability
+
+Every retrieval stage emits structured `[DEBUG]` logs — extracted keywords,
+anchor terms, CQL tier hit counts, ranked titles, AI-pick index, confidence
+gate decisions. Failure modes are diagnosable without model introspection,
+which is a prerequisite for iterating on any production RAG system and
+running offline quality evals.
+
+### Why this architecture generalises
+
+The core patterns here — classical-retrieval-plus-LLM-rerank, strict grounding
+with a labeled fallback, per-task prompt/temperature specialisation,
+deterministic output post-processing, and structured telemetry — are the
+same patterns behind enterprise AI assistants, RAG copilots, agentic
+pipelines, and policy-governed generative systems. The code base is a
+small, self-contained example of end-to-end applied AI engineering rather
+than a single model call wrapped in a route handler.
+
+---
+
 ## Architecture
 
 ```
