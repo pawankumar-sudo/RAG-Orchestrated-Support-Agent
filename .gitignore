@@ -1,9 +1,40 @@
-venv/
-node_modules/
+# Secrets
 .env
 .env.*
-*.pyc
+*.pem
+*.key
+
+# Python
+venv/
+.venv/
+env/
 __pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node (for index.js / local.js side, if used)
+node_modules/
+package-lock.json
+
+# Editors / OS
 .DS_Store
-output.json
+.vscode/
+.idea/
+*.swp
+*.swo
+.cursor/
+
+# Local data / logs
 *.log
+output.json
+response.json
+JC_CommandResults.csv
+
+# Temp scripts
+.gemini_cleanup.py

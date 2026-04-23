@@ -1,13 +1,8 @@
 from flask import Flask, request, Response
 import json
-from index import handler, handle_interactive, handle_events
+from index import handle_interactive, handle_events
 
 app = Flask(__name__)
-
-# Slash command
-@app.route("/slack", methods=["POST"])
-def slack_command():
-    return handler(request)
 
 # Button clicks
 @app.route("/slack/interactive", methods=["POST"])

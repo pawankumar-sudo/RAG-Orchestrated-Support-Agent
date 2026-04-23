@@ -28,12 +28,12 @@ AUTH = (JIRA_EMAIL, ATLASSIAN_API_TOKEN)
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
 BOT_USER_ID = os.environ.get("SLACK_BOT_USER_ID")
+URGENT_ESCALATION_CHANNEL = os.environ.get("URGENT_ESCALATION_CHANNEL", "C0ARXM5MTUM")  # Private channel for urgent IT escalation
 
-# ---------- DM CONVERSATION STORE ----------
-active_threads = {}
-# When a user writes in the DM *main* pane (not in the thread), map channel → root thread_ts
-# so `ticket`, follow-ups, etc. still hit the same session and history.
-dm_channel_active_thread = {}
+# ---------- CONVERSATION STORE ----------
+active_threads = {}  # thread_ts → {channel, user_id, query, next_index, history}
+# (channel, user_id) → thread_ts, to route channel-main replies back to their active thread
+user_active_thread = {}
 
 # ---------- KB SUMMARY CACHE ----------
 SUMMARY_CACHE_TTL_SEC = int(os.environ.get("KB_SUMMARY_CACHE_TTL_SEC", "3600"))
@@ -50,7 +50,7 @@ def _env_truthy(name, default="false"):
 KB_AI_ARTICLE_PICK_ENABLED = _env_truthy("KB_AI_ARTICLE_PICK", "true")
 KB_AI_PICK_MAX_CANDIDATES = max(3, min(20, int(os.environ.get("KB_AI_PICK_MAX_CANDIDATES", "12"))))
 
-# AI chat (DM / engineer) must only use Confluence excerpts when true — no generic “best guess” procedures.
+# AI chat (DM / engineer) must only use Confluence excerpts when true — no generic "best guess" procedures.
 AI_KB_GROUNDING_ENABLED = _env_truthy("AI_KB_GROUNDING", "true")
 AI_GROUNDING_MAX_PAGES = max(1, min(12, int(os.environ.get("AI_GROUNDING_MAX_PAGES", "5"))))
 AI_GROUNDING_PER_PAGE_CHARS = max(800, min(8000, int(os.environ.get("AI_GROUNDING_PER_PAGE_CHARS", "3500"))))
@@ -64,36 +64,18 @@ except ValueError:
 
 def _unbind_active_thread(thread_ts):
     data = active_threads.pop(thread_ts, None)
-    if not data:
-        return
-    ch = data.get("dm_channel")
-    if ch and dm_channel_active_thread.get(ch) == thread_ts:
-        dm_channel_active_thread.pop(ch, None)
+    if data:
+        key = (data.get("channel"), data.get("user_id"))
+        if user_active_thread.get(key) == thread_ts:
+            user_active_thread.pop(key, None)
 
 
-def _discard_dm_session_for_channel(dm_channel):
-    """Drop any in-flight support thread for this DM (e.g. user starts a brand-new issue)."""
-    ts = dm_channel_active_thread.pop(dm_channel, None)
-    if ts and ts in active_threads:
-        del active_threads[ts]
-
-
-def _active_thread_for_dm(dm_channel, user_id):
-    if not dm_channel or not user_id:
-        return None
-    ts = dm_channel_active_thread.get(dm_channel)
-    if not ts or ts not in active_threads:
-        if ts:
-            dm_channel_active_thread.pop(dm_channel, None)
-        return None
-    if active_threads[ts].get("user_id") != user_id:
-        return None
-    return ts
-
-
-def _bind_dm_thread(dm_channel, thread_ts, payload):
+def _bind_thread(thread_ts, payload):
     active_threads[thread_ts] = payload
-    dm_channel_active_thread[dm_channel] = thread_ts
+    ch = payload.get("channel")
+    uid = payload.get("user_id")
+    if ch and uid:
+        user_active_thread[(ch, uid)] = thread_ts
 
 
 def _ticket_summary_from_history(history):
@@ -232,8 +214,8 @@ HIGH_SIGNAL_TERMS = frozenset({
     "trello", "github", "gitlab", "aws", "azure", "gcp", "slack", "zoom", "dialpad", "ringcentral",
 })
 
-# For “can’t connect / not working” style queries, require one of these *by name in the page title*
-# so hub pages that only mention the product in passing (body) don’t win over real how-tos.
+# For "can't connect / not working" style queries, require one of these *by name in the page title*
+# so hub pages that only mention the product in passing (body) don't win over real how-tos.
 TITLE_STRICT_PRODUCTS = frozenset({
     "twingate", "netskope", "jumpcloud", "bitwarden", "okta", "zscaler", "citrix", "intune",
     "forticlient", "anyconnect", "wireguard", "openvpn", "jamf", "duo",
@@ -713,8 +695,10 @@ def _format_kb_excerpts_positive_block(body):
     if not (body or "").strip():
         return ""
     return (
-        "--- INTERNAL KB EXCERPTS (only trusted source for procedures & company-specific facts; "
-        "mention article title or URL when you rely on one) ---\n"
+        "--- INTERNAL KB EXCERPTS (authoritative source for procedures & company-specific facts). "
+        "IMPORTANT: the [1], [2], [3] indices below are for YOUR internal reference only — "
+        "NEVER copy them into your reply. Do NOT write 'KB[1]', '[4]', '(source 2)', or any citation "
+        "token in the user-facing response. Refer to articles by title in plain prose if needed. ---\n"
         f"{body}\n"
         "--- END INTERNAL KB EXCERPTS ---"
     )
@@ -972,7 +956,10 @@ def ask_ai(user_input, retrieval_query=None):
         "- Keep each step to 1–3 tight sentences — no filler.\n"
         "- Do NOT use markdown headings (# or ##) or **double bold**.\n"
         "- Do NOT use tables.\n"
-        "- End with: 'If this doesn't resolve it, create a Jira ticket so we can pick up with full tooling and access.'\n"
+        "- End with ONE *specific* clarifying question that narrows down the fix "
+        "(e.g., 'What OS are you on — Mac or Windows?', 'Does this happen on Wi-Fi or wired?', "
+        "'Which browser — Chrome, Safari, or Edge?', 'What's the exact error text?'). "
+        "Never generic like 'any other info?' — must be specific to their issue.\n"
         "- Keep total response under 2000 characters.\n\n"
     )
     if AI_KB_GROUNDING_ENABLED:
@@ -1067,15 +1054,40 @@ def redact_sensitive_instructions(text):
     alnum = re.sub(r"[^a-zA-Z0-9]+", "", result)
     if any_redacted and len(alnum) < 120:
         return (
-            "⚠️ Most of this guidance involves *administrator-only* steps we can’t paste in chat.\n\n"
+            "⚠️ Most of this guidance involves *administrator-only* steps we can't paste in chat.\n\n"
             "Create a Jira *ticket* so IT can run the privileged parts safely."
         )
     return result
 
 
+_CITATION_TOKEN_RE = re.compile(
+    r"\s*(?:"
+    r"KB\s*\[\d+\]|"                    # KB[4], KB [5]
+    r"\[\s*KB\s*\d+\s*\]|"              # [KB 4], [KB4]
+    r"\[\s*\d{1,2}\s*\]|"               # [4], [5] (standalone index)
+    r"\(\s*KB\s*\d+\s*\)|"              # (KB 1), (KB1)
+    r"\(\s*source\s*[:：]?\s*\d+\s*\)|" # (source: 1)
+    r"\bsource\s*\[\d+\]|"              # source[1]
+    r"\bref\s*\[\d+\]"                  # ref[1]
+    r")",
+    re.IGNORECASE,
+)
+
+
+def strip_citation_tokens(text):
+    """Remove AI-generated citation markers like KB[1], [4], (source: 2), etc."""
+    if not text:
+        return text
+    cleaned = _CITATION_TOKEN_RE.sub("", text)
+    # Collapse double spaces left behind
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.!?;:])", r"\1", cleaned)
+    return cleaned
+
+
 def enforce_security_policy(ai_text):
-    """Prefer redaction of risky lines; only hard-block when almost nothing safe remains."""
-    return redact_sensitive_instructions(ai_text)
+    """Prefer redaction of risky lines; also strip citation tokens. Only hard-block when almost nothing safe remains."""
+    return strip_citation_tokens(redact_sensitive_instructions(ai_text))
 
 # ---------- GEMINI AI (multi-turn chat) ----------
 CHAT_SYSTEM_PROMPT = (
@@ -1096,7 +1108,12 @@ CHAT_SYSTEM_PROMPT = (
     "6. Prefer short paragraphs plus numbered steps; end with what to try next *or* what info you need.\n"
     "7. If the user says the issue is resolved, confirm briefly and wish them well.\n"
     "8. Earlier messages may include a *knowledge-base summary* you (or the system) pasted — "
-    "treat that as ground truth for follow-ups; don’t pretend it never happened."
+    "treat that as ground truth for follow-ups; don't pretend it never happened.\n"
+    "9. ALWAYS end your reply with ONE *specific* clarifying question that helps narrow down the fix "
+    "(e.g., 'What OS are you on — Mac or Windows?', 'Does this happen on Wi-Fi, wired, or both?', "
+    "'Which browser — Chrome, Safari, or Edge?', 'What's the exact error text you see?'). "
+    "The question must be *specific* to their issue — never generic like 'any other info?'. "
+    "Skip this ONLY if the user has confirmed the issue is resolved."
 )
 
 CHAT_KB_GROUNDING_APPEND = (
@@ -1105,7 +1122,11 @@ CHAT_KB_GROUNDING_APPEND = (
     "procedures, company tool names as documented, and policy facts.\n"
     "- Base numbered troubleshooting *only* on those excerpts. Do *not* add steps from general internet "
     "knowledge or guesswork.\n"
-    "- If excerpts clearly cover the issue, synthesize and cite which article (title or URL) you used.\n"
+    "- If excerpts clearly cover the issue, synthesize the guidance *naturally* without citation markers.\n"
+    "- *NEVER* write citation tokens like `KB[1]`, `KB[4]`, `[1]`, `[2]`, `[3]`, `[source:...]`, `(1)`, etc. "
+    "in your reply. Write prose only — no reference/citation brackets of any kind.\n"
+    "- If you need to refer to the source, mention the article *title* in plain prose (e.g. _'per the VPN setup guide'_) — "
+    "do *not* use numbered references.\n"
     "- If excerpts are missing or insufficient, say so honestly — do not invent fixes; suggest `ticket` "
     "and ask neutral clarifiers.\n"
     "- You may still use the conversation transcript for *symptoms* and *what the user tried*; not for "
@@ -1120,7 +1141,7 @@ CHAT_GENERAL_NO_KB_APPEND = (
     "same security rules above (user-level steps only; omit admin/registry/terminal/BIOS procedures; never "
     "disable antivirus, firewall, MDM, or VPN enforcement; use one-line `ticket` deferrals for privileged work).\n"
     "- Open with one short line such as: *_No matching internal KB article — this is general guidance; your "
-    "org’s policies and tools may differ._*\n"
+    "org's policies and tools may differ._*\n"
     "- Do *not* invent company-specific URLs, product rollouts, or policies. If the issue is org-specific, "
     "say so and suggest `ticket`.\n"
     "- You may ask neutral clarifying questions (OS, exact error, when it started) like a service desk engineer."
@@ -1168,13 +1189,17 @@ def ask_ai_with_history(history, session_query=None):
     return enforce_security_policy(raw)
 
 # ---------- SLACK BOT HELPERS ----------
-def slack_post_message(channel, text=None, thread_ts=None, blocks=None):
+def slack_post_message(channel, text=None, thread_ts=None, blocks=None, attachments=None):
     payload = {"channel": channel}
     if text is not None:
         payload["text"] = text
     if blocks is not None:
         payload["blocks"] = blocks
-    if not payload.get("text") and not payload.get("blocks"):
+    if attachments is not None:
+        payload["attachments"] = attachments
+    if thread_ts is not None:
+        payload["thread_ts"] = thread_ts
+    if not payload.get("text") and not payload.get("blocks") and not payload.get("attachments"):
         payload["text"] = "IT Help"
     r = requests.post(
         "https://slack.com/api/chat.postMessage",
@@ -1219,19 +1244,6 @@ def slack_delete_message(channel, ts):
     return data.get("ok")
 
 
-def slack_post_ephemeral(channel, user_id, text):
-    r = requests.post(
-        "https://slack.com/api/chat.postEphemeral",
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-        json={"channel": channel, "user": user_id, "text": text},
-        timeout=10
-    )
-    data = r.json()
-    if not data.get("ok"):
-        print(f"[DEBUG] slack_post_ephemeral FAILED: {data.get('error')}")
-    return data.get("ok")
-
-
 def get_bot_user_id():
     """
     Resolve bot user id once (used for mention-detection fallback on message events).
@@ -1254,78 +1266,45 @@ def get_bot_user_id():
     return None
 
 
-def slack_publish_home(user_id):
-    """
-    Publish a simple, useful App Home so users don't see Slack's default placeholder.
-    """
-    home_view = {
-        "type": "home",
-        "blocks": [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "🤖 IT Help Bot", "emoji": True},
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        "*Welcome!* I can help you troubleshoot common IT issues and guide you to the right next step quickly."
-                    ),
-                },
-            },
-            {"type": "divider"},
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        "*Main Facilities*\n"
-                        "• *Smart KB Search* — finds relevant Confluence articles for your issue\n"
-                        "• *Need More Help* — checks additional related articles (up to 2) before AI fallback\n"
-                        "• *AI Troubleshooting* — step-by-step guidance when KB is not enough\n"
-                        "• *Private Support Flow* — continues sensitive troubleshooting in DM\n"
-                        "• *Jira Ticket Creation* — type `ticket` or use `/it jira <issue>` for escalation"
-                    ),
-                },
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        "*How To Use*\n"
-                        "1. In any channel: `/it help <your issue>`\n"
-                        "2. Or open *Messages* tab and describe your issue directly\n"
-                        "3. If needed, click *Need More Help* for deeper assistance"
-                    ),
-                },
-            },
-            {
-                "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": (
-                            "_For security, admin-only steps are not exposed in chat. "
-                            "If elevated access is required, please create a Jira ticket._"
-                        ),
-                    }
-                ],
-            },
-        ],
-    }
+# Cache Slack user_id → display name to avoid hitting users.info repeatedly
+_slack_user_name_cache = {}
 
-    r = requests.post(
-        "https://slack.com/api/views.publish",
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-        json={"user_id": user_id, "view": home_view},
-        timeout=10,
-    )
-    data = r.json()
-    if not data.get("ok"):
-        print(f"[DEBUG] slack_publish_home FAILED: {data.get('error')}")
-    return data.get("ok")
+
+def get_slack_user_name(user_id):
+    """
+    Resolve Slack user_id to a readable display name (real name or display name).
+    Falls back to the raw user_id if lookup fails.
+    """
+    if not user_id:
+        return "Unknown User"
+    if user_id in _slack_user_name_cache:
+        return _slack_user_name_cache[user_id]
+    try:
+        r = requests.get(
+            "https://slack.com/api/users.info",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            params={"user": user_id},
+            timeout=10,
+        )
+        data = r.json()
+        if data.get("ok"):
+            user = data.get("user", {}) or {}
+            profile = user.get("profile", {}) or {}
+            name = (
+                profile.get("real_name_normalized")
+                or profile.get("real_name")
+                or profile.get("display_name_normalized")
+                or profile.get("display_name")
+                or user.get("real_name")
+                or user.get("name")
+                or user_id
+            )
+            _slack_user_name_cache[user_id] = name
+            return name
+        print(f"[DEBUG] get_slack_user_name FAILED: {data.get('error')}")
+    except Exception as e:
+        print(f"[DEBUG] get_slack_user_name ERROR: {e}")
+    return user_id
 
 
 def post_live_wait_status(channel, thread_ts=None, phase="working"):
@@ -1369,72 +1348,27 @@ def start_live_spinner(channel, label, thread_ts=None, interval_s=1.0):
     return _stop
 
 
-def open_dm(user_id):
-    r = requests.post(
-        "https://slack.com/api/conversations.open",
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-        json={"users": user_id},
-        timeout=10
-    )
-    data = r.json()
-    if data.get("ok"):
-        return data["channel"]["id"]
-    print(f"[DEBUG] open_dm FAILED: {data.get('error')}")
-    return None
-
-def start_ai_dm_thread(query, user_id):
-    dm_channel = open_dm(user_id)
-    print(f"[DEBUG] start_ai_dm_thread: dm_channel={dm_channel}")
-    if not dm_channel:
-        print("[DEBUG] Failed to open DM channel")
-        return
-
-    _discard_dm_session_for_channel(dm_channel)
-
-    thread_ts = slack_post_message(
-        dm_channel,
-        f"👋 *IT Support* — I’ve got your request.\n\n"
-        f"*What you reported:* _{query}_\n\n"
-        f"_Reviewing details now — I’ll reply in this thread with the next steps._"
-    )
-    if not thread_ts:
-        return
-
+def start_ai_thread(channel, user_id, query, thread_ts):
+    """Start AI troubleshooting in an existing channel thread (no DM)."""
     history = [{"role": "user", "parts": [{"text": query}]}]
-    stop_spinner = start_live_spinner(dm_channel, "Analyzing your issue and preparing first steps…", thread_ts=thread_ts)
+    ai_spinner = start_live_spinner(channel, "Analyzing your issue and preparing first steps…", thread_ts=thread_ts)
     try:
         ai_response = ask_ai_with_history(history, session_query=query)
         ai_slack = slack_format(ai_response)
         history.append({"role": "model", "parts": [{"text": ai_response}]})
     finally:
-        stop_spinner()
+        ai_spinner()
 
-    _bind_dm_thread(
-        dm_channel,
-        thread_ts,
-        {
-            "dm_channel": dm_channel,
-            "user_id": user_id,
-            "query": query,
-            "next_index": 0,
-            "history": history,
-        },
-    )
+    _bind_thread(thread_ts, {
+        "channel": channel,
+        "user_id": user_id,
+        "query": query,
+        "next_index": 0,
+        "history": history,
+    })
 
-    slack_post_message(
-        dm_channel,
-        f"{ai_slack}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💬 _Reply in this thread to continue chatting._\n"
-        "Type `done` to end  •  Type `ticket` to create a Jira ticket.",
-        thread_ts=thread_ts
-    )
-    slack_post_message(
-        dm_channel,
-        text="Need more help options",
-        blocks=_ai_controls_blocks(query=query, next_index=0),
-        thread_ts=thread_ts,
-    )
+    slack_post_message(channel, ai_slack, thread_ts=thread_ts)
+    _post_ai_followup(channel, thread_ts, query, history)
 
 # ---------- KB SUMMARIZATION ----------
 def summarize_kb(title, raw_text, user_query):
@@ -1446,7 +1380,7 @@ def summarize_kb(title, raw_text, user_query):
 
     prompt = (
         "You are a *senior IT support engineer* rewriting an internal KB article for Slack.\n\n"
-        "A Confluence article matched the employee’s request. Rewrite it as a *clear, accurate runbook* — "
+        "A Confluence article matched the employee's request. Rewrite it as a *clear, accurate runbook* — "
         "professional, precise, and easy to follow for a non‑technical reader.\n\n"
         "WRITING RULES:\n"
         "- Open with one line tying the article to *their* question (what this doc helps them do).\n"
@@ -1454,11 +1388,11 @@ def summarize_kb(title, raw_text, user_query):
         "- Bold buttons, menu names, and field labels with *bold* (single asterisk — Slack format).\n"
         "- If Windows vs Mac differs, label sections *Windows* / *Mac*.\n"
         "- Call out common failure points (*wrong account, cached credentials, VPN state*) when the source implies it.\n"
-        "- If the source is vague, say what is *known from the article* and what *needs IT* — don’t invent policy.\n"
+        "- If the source is vague, say what is *known from the article* and what *needs IT* — don't invent policy.\n"
         "- Skip TOC, metadata, author noise, and unrelated sections.\n"
         "- Do NOT use markdown headings (# or ##) or **double bold**.\n"
         "- Do NOT use tables.\n"
-        "- If the article clearly does *not* address the user’s issue, say so in one honest sentence "
+        "- If the article clearly does *not* address the user's issue, say so in one honest sentence "
         "and suggest they reply with more detail or open a ticket.\n\n"
         "ADMIN / ELEVATED CONTENT (critical):\n"
         "- The Confluence source may mix *end-user* steps with *IT-only* steps (registry, PowerShell, sudo, "
@@ -1494,7 +1428,7 @@ def summarize_kb(title, raw_text, user_query):
 
 
 def _summary_chunk_at_limit(text, limit):
-    """Prefer paragraph/sentence boundary so Slack blocks don’t end on 'limi…'."""
+    """Prefer paragraph/sentence boundary so Slack blocks don't end on 'limi…'."""
     if len(text) <= limit:
         return text, ""
     chunk = text[:limit]
@@ -1524,85 +1458,191 @@ def _summary_to_blocks(summary_text):
 
 
 def _kb_blocks_with_actions(kb, kb_summary, query):
-    """Block Kit for a KB card + Need More Help + Create Jira (same shape in DM and slash ephemeral)."""
+    """Block Kit for a KB card (article content only — follow-up CTA posted separately with color)."""
     summary_blocks = _summary_to_blocks(kb_summary)
     return [
         {"type": "header", "text": {"type": "plain_text", "text": f"📘 {kb['title'][:130]}", "emoji": True}},
         *summary_blocks,
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text": f"🔗 <{kb['url']}|Open full article with images>"}},
-        {
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": "_Still not the right doc? Click *Need More Help* below, or reply here with what you expected. `ticket` opens Jira._"}],
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "action_id": "need_more_help",
-                    "text": {"type": "plain_text", "text": "Need More Help"},
-                    "value": json.dumps({"query": query, "index": kb["next_index"]}),
-                },
-                {
-                    "type": "button",
-                    "action_id": "create_jira_ticket",
-                    "text": {"type": "plain_text", "text": "Create Jira Ticket"},
-                    "style": "primary",
-                    "value": query,
-                },
-            ],
-        },
     ]
 
 
-def _ai_controls_blocks(query, next_index=0):
+def _kb_followup_attachment(query, next_index):
+    """Colored attachment that grabs attention after a KB card — nudges user to reply + Need More Help button."""
+    return [{
+        "color": "#FFB347",  # warm orange accent
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "🔔  *Didn't fully solve your issue?*\n"
+                        "👉 *Reply right here* with more detail — *exact error, what you tried, OS/device, when it started* — "
+                        "and I'll tailor the fix to *your* situation.\n\n"
+                        "_Or tap *Need More Help* below for general AI troubleshooting._"
+                    ),
+                },
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": "need_more_help",
+                        "text": {"type": "plain_text", "text": "Need More Help"},
+                        "value": json.dumps({"query": query, "index": next_index}),
+                    },
+                ],
+            },
+        ],
+    }]
+
+
+def _post_ai_followup(channel, thread_ts, query, history):
+    """After every AI reply, show satisfaction buttons (with a 'before you click' nudge) in a colored attachment."""
+    slack_post_message(
+        channel,
+        text="Was this helpful?",
+        attachments=_satisfaction_attachment(query=query),
+        thread_ts=thread_ts,
+    )
+
+
+def _satisfaction_attachment(query):
+    """Colored attachment grouping the 'before you click' nudge + Satisfied/Not Satisfied buttons."""
+    return [{
+        "color": "#F2C744",  # bright yellow — attention-grabbing
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "⚡ *Before you decide…*\n"
+                        "Have you actually *tried the steps above*? If you hit any confusion or see a "
+                        "new error, *just reply here* and I'll adjust the fix to your exact situation."
+                    ),
+                },
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": "satisfied",
+                        "text": {"type": "plain_text", "text": "✅ Helpful (end the chat)"},
+                        "style": "primary",
+                        "value": json.dumps({"query": query}),
+                    },
+                    {
+                        "type": "button",
+                        "action_id": "not_satisfied",
+                        "text": {"type": "plain_text", "text": "❌ Not Helpful (For Ticket and IT Engineer Support)"},
+                        "style": "danger",
+                        "value": json.dumps({"query": query}),
+                    },
+                ],
+            },
+        ],
+    }]
+
+
+def _not_satisfied_blocks(query):
+    """Create Jira Ticket + Get Help Now (Urgent) buttons shown after Not Satisfied."""
     return [
         {
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": "_Need more depth? Use the button below. I’ll check up to 2 related KBs, then continue with AI if needed._"}],
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "Sorry this didn't resolve your issue. Choose an option below:",
+            },
         },
         {
             "type": "actions",
             "elements": [
                 {
                     "type": "button",
-                    "action_id": "need_more_help",
-                    "text": {"type": "plain_text", "text": "Need More Help"},
-                    "value": json.dumps({"query": query, "index": next_index}),
+                    "action_id": "create_jira_ticket",
+                    "text": {"type": "plain_text", "text": "📝 Create Jira Ticket"},
+                    "style": "primary",
+                    "value": query,
                 },
                 {
                     "type": "button",
-                    "action_id": "create_jira_ticket",
-                    "text": {"type": "plain_text", "text": "Create Jira Ticket"},
-                    "style": "primary",
-                    "value": query,
+                    "action_id": "get_help_urgent",
+                    "text": {"type": "plain_text", "text": "🚨 Get Help Now (Urgent)"},
+                    "style": "danger",
+                    "value": json.dumps({"query": query}),
                 },
             ],
         },
     ]
 
 
-def _interaction_is_dm_channel(payload):
-    cid = (payload.get("channel") or {}).get("id") or ""
-    return cid.startswith("D")
+def _handle_urgent_escalation(channel, thread_ts, user_id, query):
+    """Cross-post the thread to the urgent escalation channel, create a Jira ticket, and notify the user."""
+    if not URGENT_ESCALATION_CHANNEL:
+        slack_post_message(
+            channel,
+            "⚠️ Urgent escalation channel is not configured. Please contact IT directly.",
+            thread_ts=thread_ts,
+        )
+        return
+
+    # Create Jira ticket with conversation history
+    conv = active_threads.get(thread_ts)
+    user_name = get_slack_user_name(user_id)
+    if conv and conv.get("history"):
+        summary = _ticket_summary_from_history(conv["history"])
+        desc = _ticket_description_transcript(conv["history"], user_name)
+    else:
+        summary = (query or "Urgent IT Help request from Slack")[:240]
+        desc = f"Created from Slack IT Help (Urgent)\n\nSlack User: {user_name}\n\nIssue: {query}"
+    try:
+        ticket_result = create_jira_ticket(summary, user_name, description=desc)
+    except Exception as exc:
+        print(f"[DEBUG] Urgent escalation Jira ticket failed: {exc}")
+        ticket_result = "⚠️ Could not create Jira ticket automatically — please create one manually."
+
+    # Build thread link
+    thread_link = f"https://slack.com/archives/{channel}/p{thread_ts.replace('.', '')}"
+
+    # Build history summary for escalation message
+    history_summary = ""
+    if conv and conv.get("history"):
+        lines = []
+        for m in conv["history"][-6:]:
+            role = "Employee" if m.get("role") == "user" else "IT Bot"
+            lines.append(f"*{role}:* {m['parts'][0]['text'][:300]}")
+        history_summary = "\n".join(lines)
+
+    escalation_text = (
+        f"🚨 *URGENT IT Help Request* from *{user_name}* (<@{user_id}>)\n\n"
+        f"*Issue:* {query[:500]}\n\n"
+    )
+    if history_summary:
+        escalation_text += f"*Thread Summary:*\n{history_summary}\n\n"
+    escalation_text += f"{ticket_result}\n\n"
+    escalation_text += f"🔗 <{thread_link}|View full thread>"
+
+    slack_post_message(URGENT_ESCALATION_CHANNEL, escalation_text)
+
+    slack_post_message(
+        channel,
+        f"🚨 *Urgent help requested!* Your issue has been escalated to the IT team.\n"
+        f"{ticket_result}\n"
+        "An engineer will respond shortly.",
+        thread_ts=thread_ts,
+    )
+    _unbind_active_thread(thread_ts)
 
 
 def _interaction_thread_ts(payload):
     msg = payload.get("message") or {}
     return msg.get("thread_ts") or msg.get("ts")
 
-
-# ---------- SIDEBAR DM ROUTING (engineer-like UX) ----------
-_IT_TOPIC = re.compile(
-    r"\b(vpn|twingate|wifi|wi-?fi|wireless|lan|ethernet|email|outlook|gmail|password|passcode|mfa|2fa|otp|"
-    r"laptop|macbook|windows|pc|imac|monitor|dock|usb|printer|drive|onedrive|google\s*drive|slack|teams|zoom|"
-    r"jumpcloud|bitwarden|mdm|intune|citrix|sap|license|install|uninstall|update|upgrade|"
-    r"crash|hang|freeze|slow|error|login|sign\s*in|cannot|can't|can\s*not|unable|broken|"
-    r"not\s*working|doesn'?t\s*work|won'?t\s*connect|no\s*internet|screen|display|audio|microphone|camera|"
-    r"headset|keyboard|mouse)\b",
-    re.I,
-)
 
 _FEEDBACK = re.compile(
     r"\b("
@@ -1616,7 +1656,7 @@ _FEEDBACK = re.compile(
     re.I,
 )
 
-# Common typo: user omits “not” (“no, this is what i am looking for” meaning the opposite)
+# Common typo: user omits "not" ("no, this is what i am looking for" meaning the opposite)
 _FEEDBACK_TYPOS = re.compile(
     r"(\bno\s*,?\s+this\s+is\s+(what\s+)?i\s+am\s+looking\s+for\b)|"
     r"(\bno\s*,?\s+thisis\s+what\s+i\s+am\s+looking\s+for\b)",
@@ -1631,66 +1671,12 @@ def is_feedback_text(text):
     return bool(_FEEDBACK.search(text))
 
 
-_GREETING_ONLY = re.compile(
-    r"^(hi+|hello+|hey+|good\s+(morning|afternoon|evening)|hiya|yo|sup|howdy|thanks?|thank\s+you|ty|thx|"
-    r"bye+|cya|later|cheers|ok+ay?)[\s,!.]*$",
-    re.I,
-)
-
-
-def classify_sidebar_message(text):
-    """Route sidebar DM without an extra model call when possible."""
-    t = (text or "").strip()
-    if not t:
-        return "UNCLEAR"
-    low = t.lower()
-    # Reserved session commands — must never be treated as generic "greeting"
-    if low in ("ticket", "tickets"):
-        return "TICKET_CMD"
-    if low in ("done", "end", "exit"):
-        return "DONE_CMD"
-    if is_feedback_text(t):
-        return "FEEDBACK"
-    if _IT_TOPIC.search(t):
-        return "IT_ISSUE"
-    if _GREETING_ONLY.match(t) and len(t) < 80:
-        return "GREETING"
-    if len(t) < 50 and not any(ch.isdigit() for ch in t):
-        return "GREETING"
-    return "IT_ISSUE"
-
-
-def engineer_smalltalk_reply(user_text):
-    prompt = (
-        "You are a *senior IT support engineer* replying in Slack DM. The employee sent a short social message.\n\n"
-        "Reply in 2–4 sentences: professional, human, not robotic — but not overly casual.\n"
-        "- Acknowledge them briefly.\n"
-        "- Invite them to describe a *work technology* issue (*VPN, email, laptop, access, software*).\n"
-        "- Do not invent troubleshooting steps or tools.\n\n"
-        "FORMAT: Slack mrkdwn — *bold* only for emphasis; no ## headings or **double bold**; no tables.\n\n"
-        f"Employee message: {user_text}"
-    )
-    try:
-        raw = gemini_generate(
-            contents=[{"parts": [{"text": prompt}]}],
-            generation_config={"temperature": 0.35, "maxOutputTokens": 512},
-            timeout=(10, 45),
-            retries=2,
-        )
-        return enforce_security_policy(raw)
-    except Exception:
-        return (
-            "Hi — I’m here. Tell me what’s going wrong with your *work tech* "
-            "(*VPN*, *email*, *laptop*, *access*, *software*), and I’ll walk you through the next checks."
-        )
-
-
 def engineer_feedback_reply(user_text, prior_snippets):
     ctx = "\n".join(prior_snippets[-6:]) if prior_snippets else "(no prior thread context)"
     augmented = (
         "Context — recent DM lines:\n"
         f"{ctx}\n\n"
-        "The user indicates the previous answer, article, or direction wasn’t what they needed.\n\n"
+        "The user indicates the previous answer, article, or direction wasn't what they needed.\n\n"
         f"Their latest message: {user_text}\n\n"
         "Respond as a *senior IT engineer*:\n"
         "- Brief apology, no drama.\n"
@@ -1698,78 +1684,64 @@ def engineer_feedback_reply(user_text, prior_snippets):
         "- Ask *specific* clarifiers (what they expected, system/OS, exact error text, app name, when it started).\n"
         "- Do *not* paste a generic KB wall or repeat the last article unless they ask.\n"
         "- Mention they can use *Need More Help* on the last KB card if one was shown.\n"
-        "- Offer `ticket` if they’re blocked or it needs admin access.\n\n"
+        "- Offer `ticket` if they're blocked or it needs admin access.\n\n"
         "FORMAT: Slack — numbered list optional; *bold* for emphasis; no ## or **; no tables; keep under ~1200 chars."
     )
     try:
         return enforce_security_policy(ask_ai(augmented, retrieval_query=user_text))
     except Exception:
         return (
-            "Sorry that wasn’t the right fix. Tell me in one sentence *what outcome you need*, "
-            "your *OS* if relevant, and any *exact error text* — I’ll narrow this down. "
-            "If you’re blocked, type `ticket` to log it for IT."
+            "Sorry that wasn't the right fix. Tell me in one sentence *what outcome you need*, "
+            "your *OS* if relevant, and any *exact error text* — I'll narrow this down. "
+            "If you're blocked, type `ticket` to log it for IT."
         )
 
 
-def _post_kb_thread_and_register(dm_channel, user_id, user_text, kb, query):
+def _post_kb_in_thread(channel, user_id, query, kb, thread_ts):
+    """Post KB article in the existing channel thread, then a colored follow-up CTA."""
     src = kb.get("summary_source") or kb["text"]
     kb_summary = summarize_kb(kb["title"], src, query)
     blocks = _kb_blocks_with_actions(kb, kb_summary, query)
-    _discard_dm_session_for_channel(dm_channel)
 
-    thread_ts = slack_post_message(dm_channel, text=f"KB: {kb['title']}", blocks=blocks)
-    if not thread_ts:
-        return
-    clip = kb_summary[:3500]
-    _bind_dm_thread(
-        dm_channel,
-        thread_ts,
-        {
-            "dm_channel": dm_channel,
-            "user_id": user_id,
-            "query": query,
-            "next_index": kb["next_index"],
-            "history": [
-                {"role": "user", "parts": [{"text": user_text}]},
-                {"role": "model", "parts": [{"text": f"We walked through internal KB *{kb['title']}* (summary):\n\n{clip}"}]},
-            ],
-        },
+    slack_post_message(channel, text=f"KB: {kb['title']}", blocks=blocks, thread_ts=thread_ts)
+    # Highlighted attention-grabbing follow-up CTA
+    slack_post_message(
+        channel,
+        text="Reply for a tailored fix",
+        attachments=_kb_followup_attachment(query, kb["next_index"]),
+        thread_ts=thread_ts,
     )
+    clip = kb_summary[:3500]
+    _bind_thread(thread_ts, {
+        "channel": channel,
+        "user_id": user_id,
+        "query": query,
+        "next_index": kb["next_index"],
+        "history": [
+            {"role": "user", "parts": [{"text": query}]},
+            {"role": "model", "parts": [{"text": f"We walked through internal KB *{kb['title']}* (summary):\n\n{clip}"}]},
+        ],
+    })
 
 
-def _need_more_help_flow(
-    dm_channel, user_id, query, start_index=0, thread_ts=None, max_extra=2, action_id="need_more_help"
-):
+def _need_more_help_flow(channel, user_id, query, start_index=0, thread_ts=None, action_id="need_more_help"):
     """
-    In DM context:
-    - action_id need_more_help: one click -> AI engineer chat (discovery / dig into the issue); no extra KB round.
-    - action_id show_another_article: legacy — KB search then AI if fewer than max_extra articles found.
+    Need More Help in channel thread:
+    - need_more_help: AI engineer chat (discovery / dig into the issue) + satisfaction buttons.
+    - show_another_article: KB search then AI if no more articles found.
     """
-    if not dm_channel:
+    if not channel or not thread_ts:
         return
-
-    if not thread_ts:
-        thread_ts = slack_post_message(
-            dm_channel,
-            f"🤝 *Need More Help* received.\n\nI’ll check up to *{max_extra}* additional related KB articles, "
-            "then continue with AI troubleshooting if needed.",
-        )
-        if not thread_ts:
-            return
 
     # Ensure a conversation shell exists for continuity.
     if thread_ts not in active_threads:
-        _bind_dm_thread(
-            dm_channel,
-            thread_ts,
-            {
-                "dm_channel": dm_channel,
-                "user_id": user_id,
-                "query": query,
-                "next_index": start_index,
-                "history": [{"role": "user", "parts": [{"text": query}]}],
-            },
-        )
+        _bind_thread(thread_ts, {
+            "channel": channel,
+            "user_id": user_id,
+            "query": query,
+            "next_index": start_index,
+            "history": [{"role": "user", "parts": [{"text": query}]}],
+        })
 
     conv = active_threads[thread_ts]
     conv["query"] = query or conv.get("query") or ""
@@ -1777,7 +1749,8 @@ def _need_more_help_flow(
     if action_id == "show_another_article":
         index = int(start_index if start_index is not None else conv.get("next_index", 0))
         shown = 0
-        spinner_stop = start_live_spinner(dm_channel, "Finding more related KB articles…", thread_ts=thread_ts)
+        max_extra = 2
+        spinner_stop = start_live_spinner(channel, "Finding more related KB articles…", thread_ts=thread_ts)
         try:
             while shown < max_extra:
                 kb = search_confluence(conv["query"], index)
@@ -1786,7 +1759,13 @@ def _need_more_help_flow(
                 src = kb.get("summary_source") or kb["text"]
                 kb_summary = summarize_kb(kb["title"], src, conv["query"])
                 blocks = _kb_blocks_with_actions(kb, kb_summary, conv["query"])
-                slack_post_message(dm_channel, text=f"KB: {kb['title']}", blocks=blocks, thread_ts=thread_ts)
+                slack_post_message(channel, text=f"KB: {kb['title']}", blocks=blocks, thread_ts=thread_ts)
+                slack_post_message(
+                    channel,
+                    text="Reply for a tailored fix",
+                    attachments=_kb_followup_attachment(conv["query"], kb["next_index"]),
+                    thread_ts=thread_ts,
+                )
                 clip = kb_summary[:3200]
                 conv["history"].append({"role": "user", "parts": [{"text": "Need more help"}]})
                 conv["history"].append(
@@ -1800,36 +1779,29 @@ def _need_more_help_flow(
         conv["next_index"] = index
 
         if shown < max_extra:
-            ai_spinner_stop = start_live_spinner(
-                dm_channel,
-                "Not enough reliable KB matches. Switching to AI troubleshooting…",
-                thread_ts=thread_ts,
-            )
-            try:
-                conv["history"].append({"role": "user", "parts": [{"text": "Need more help and KB exhausted"}]})
-                ai_response = ask_ai_with_history(conv["history"], session_query=conv.get("query"))
-                conv["history"].append({"role": "model", "parts": [{"text": ai_response}]})
-                slack_post_message(dm_channel, slack_format(ai_response), thread_ts=thread_ts)
-            except Exception as exc:
-                print(f"[DEBUG] _need_more_help_flow AI fallback ERROR: {exc}")
-                slack_post_message(dm_channel, _api_error_user_message(exc), thread_ts=thread_ts)
-            finally:
-                ai_spinner_stop()
+            _ai_fallback_in_thread(channel, conv, thread_ts)
         return
 
+    # need_more_help → AI discovery
+    _ai_fallback_in_thread(channel, conv, thread_ts)
+
+
+def _ai_fallback_in_thread(channel, conv, thread_ts):
+    """Run AI troubleshooting in a channel thread and post satisfaction buttons."""
     ai_spinner_stop = start_live_spinner(
-        dm_channel,
-        "Switching to IT support chat to understand your issue…",
+        channel,
+        "Switching to AI troubleshooting…",
         thread_ts=thread_ts,
     )
     try:
         conv["history"].append({"role": "user", "parts": [{"text": _NMH_AI_DISCOVERY_HINT}]})
         ai_response = ask_ai_with_history(conv["history"], session_query=conv.get("query"))
         conv["history"].append({"role": "model", "parts": [{"text": ai_response}]})
-        slack_post_message(dm_channel, slack_format(ai_response), thread_ts=thread_ts)
+        slack_post_message(channel, slack_format(ai_response), thread_ts=thread_ts)
+        _post_ai_followup(channel, thread_ts, conv.get("query", ""), conv["history"])
     except Exception as exc:
-        print(f"[DEBUG] _need_more_help_flow AI fallback ERROR: {exc}")
-        slack_post_message(dm_channel, _api_error_user_message(exc), thread_ts=thread_ts)
+        print(f"[DEBUG] _ai_fallback_in_thread ERROR: {exc}")
+        slack_post_message(channel, _api_error_user_message(exc), thread_ts=thread_ts)
     finally:
         ai_spinner_stop()
 
@@ -1844,10 +1816,10 @@ def _api_error_user_message(exc):
     if "429" in s or "resource exhausted" in s or "quota" in s or "rate" in s:
         return (
             "⚠️ Our AI backend is *rate-limited* right now (too many requests). "
-            "Please wait a few minutes and try again, or type `ticket` / use `/it jira` if this is urgent."
+            "Please wait a few minutes and try again, or type `ticket` if this is urgent."
         )
     return (
-        "❌ I couldn’t finish that just now. Please try again in a moment, "
+        "❌ I couldn't finish that just now. Please try again in a moment, "
         "or type `ticket` so IT can pick it up with full tools and access."
     )
 
@@ -1871,73 +1843,6 @@ def create_jira_ticket(summary, slack_user, description=None):
     r.raise_for_status()
     return f"✅ Ticket created: {r.json()['issueKey']}"
 
-# ---------- ASYNC HELP FLOW ----------
-def async_help(query, response_url, user_id):
-    try:
-        kb = search_confluence(query, 0)
-
-        if kb:
-            src = kb.get("summary_source") or kb["text"]
-            kb_summary = summarize_kb(kb["title"], src, query)
-            payload = {
-                "response_type": "ephemeral",
-                "blocks": _kb_blocks_with_actions(kb, kb_summary, query),
-            }
-            requests.post(response_url, json=payload, timeout=5)
-
-        else:
-            requests.post(response_url, json={
-                "response_type": "ephemeral",
-                "text": (
-                    "📚 No matching KB article found.\n"
-                    "🤖 I've started a *private AI chat* with you.\n\n"
-                    "👉 *Check your DMs with IT Help Bot* to continue troubleshooting."
-                )
-            }, timeout=10)
-
-            start_ai_dm_thread(query, user_id)
-
-    except Exception as e:
-        requests.post(response_url, json={
-            "response_type": "ephemeral",
-            "text": f"❌ Error: {str(e)}"
-        }, timeout=5)
-
-# ---------- SLASH COMMAND ----------
-def handler(req):
-    if not verify_slack(req):
-        return Response("Forbidden", status=403)
-
-    text = req.form.get("text", "").strip()
-    slack_user = req.form.get("user_name", "Unknown User")
-    response_url = req.form.get("response_url")
-    user_id = req.form.get("user_id")
-
-    if text.lower().startswith("help"):
-        query = text[4:].strip()
-        if not query:
-            return Response("Usage: `/it help <issue>`", status=200)
-
-        threading.Thread(
-            target=async_help,
-            args=(query, response_url, user_id),
-            daemon=True
-        ).start()
-
-        return Response(
-            "🔍 Searching knowledge base…\n"
-            "🤖 This may take a few seconds while I check our knowledge base.",
-            status=200
-        )
-
-    if text.lower().startswith("jira"):
-        query = text[4:].strip()
-        if not query:
-            return Response("Usage: `/it jira <issue>`", status=200)
-        return Response(create_jira_ticket(query, slack_user), status=200)
-
-    return Response("Usage:\n• `/it help <issue>`\n• `/it jira <issue>`", status=200)
-
 # ---------- BUTTON ----------
 def handle_interactive(req):
     if not verify_slack(req):
@@ -1951,7 +1856,6 @@ def process_interaction(payload):
         action = payload["actions"][0]
         action_id = action["action_id"]
         response_url = payload.get("response_url")
-        in_dm = _interaction_is_dm_channel(payload)
         ch = (payload.get("channel") or {}).get("id")
         thread_ts = _interaction_thread_ts(payload)
         user_obj = payload.get("user") or {}
@@ -1959,10 +1863,19 @@ def process_interaction(payload):
 
         if action_id == "create_jira_ticket":
             query = action["value"]
-            slack_user = user_obj.get("username", "Unknown User")
-            result = create_jira_ticket(query, slack_user)
-            if in_dm and ch and thread_ts:
+            user_name = get_slack_user_name(user_id) if user_id else user_obj.get("name") or user_obj.get("username") or "Unknown User"
+            # Use conversation history for description if available
+            conv = active_threads.get(thread_ts)
+            if conv and conv.get("history"):
+                summary = _ticket_summary_from_history(conv["history"])
+                desc = _ticket_description_transcript(conv["history"], user_name)
+                result = create_jira_ticket(summary, user_name, description=desc)
+            else:
+                result = create_jira_ticket(query, user_name)
+            if ch and thread_ts:
                 slack_post_message(ch, result, thread_ts=thread_ts)
+                slack_post_message(ch, "The IT team will follow up on your ticket.", thread_ts=thread_ts)
+                _unbind_active_thread(thread_ts)
             elif response_url:
                 requests.post(response_url, json={"response_type": "ephemeral", "text": result}, timeout=5)
             return
@@ -1970,40 +1883,46 @@ def process_interaction(payload):
         if action_id in ("show_another_article", "need_more_help"):
             data = json.loads(action["value"])
             query = data["query"]
-            index = data["index"]
-
-            loading = {
-                "response_type": "ephemeral",
-                "replace_original": True,
-                "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "🔍 _Searching for another matching article…_"}}],
-            }
-
-            if in_dm and ch and thread_ts:
+            index = data.get("index", 0)
+            if ch and thread_ts:
                 _need_more_help_flow(
-                    dm_channel=ch,
+                    channel=ch,
                     user_id=user_id,
                     query=query,
                     start_index=index,
                     thread_ts=thread_ts,
-                    max_extra=2,
                     action_id=action_id,
                 )
-            else:
-                # If this came from /it help in a channel, move directly to AI DM thread first.
-                if response_url:
-                    requests.post(
-                        response_url,
-                        json={
-                            "response_type": "ephemeral",
-                            "replace_original": False,
-                            "text": "🤝 *Need More Help* selected. I’ve opened a private AI troubleshooting DM for you.",
-                        },
-                        timeout=5,
-                    )
-                if user_id:
-                    start_ai_dm_thread(query, user_id)
-                elif response_url:
-                    requests.post(response_url, json=loading, timeout=5)
+            return
+
+        if action_id == "satisfied":
+            if ch and thread_ts:
+                slack_post_message(
+                    ch,
+                    "✅ Glad that helped! If you need anything else, @mention IT Help anytime.",
+                    thread_ts=thread_ts,
+                )
+                _unbind_active_thread(thread_ts)
+            return
+
+        if action_id == "not_satisfied":
+            data = json.loads(action["value"])
+            query = data.get("query", "")
+            if ch and thread_ts:
+                slack_post_message(
+                    ch,
+                    text="Escalation options",
+                    blocks=_not_satisfied_blocks(query),
+                    thread_ts=thread_ts,
+                )
+            return
+
+        if action_id == "get_help_urgent":
+            data = json.loads(action["value"])
+            query = data.get("query", "")
+            if ch and thread_ts:
+                _handle_urgent_escalation(ch, thread_ts, user_id, query)
+            return
 
     except Exception as e:
         print("Interactive error:", e)
@@ -2012,8 +1931,7 @@ def process_interaction(payload):
             ch = (payload.get("channel") or {}).get("id")
             thread_ts = _interaction_thread_ts(payload)
             response_url = payload.get("response_url")
-            in_dm = _interaction_is_dm_channel(payload)
-            if in_dm and ch and thread_ts:
+            if ch and thread_ts:
                 slack_post_message(ch, msg, thread_ts=thread_ts)
             elif response_url:
                 requests.post(
@@ -2039,63 +1957,84 @@ def handle_events(req):
         event = data.get("event", {})
         print(f"[DEBUG] Event received: type={event.get('type')}, channel_type={event.get('channel_type')}, bot_id={event.get('bot_id')}, subtype={event.get('subtype')}, thread_ts={event.get('thread_ts')}, text={event.get('text', '')[:50]}")
 
-        if event.get("type") == "app_home_opened":
-            user_id = event.get("user")
-            if user_id:
-                threading.Thread(target=slack_publish_home, args=(user_id,), daemon=True).start()
-            return Response("", status=200)
-
         if event.get("type") == "app_mention" and not event.get("bot_id"):
             threading.Thread(target=_handle_app_mention, args=(event,), daemon=True).start()
             return Response("", status=200)
 
         if event.get("type") == "message" and not event.get("bot_id") and event.get("subtype") is None:
             thread_ts_event = event.get("thread_ts")
-            channel_type = event.get("channel_type")
-            user_id_ev = event.get("user")
-            dm_channel_ev = event.get("channel")
             text_ev = event.get("text", "") or ""
+            channel_ev = event.get("channel")
+            user_ev = event.get("user")
 
-            # Fallback: if app_mention event isn't configured, still handle bot mention in channel messages.
-            if channel_type != "im":
-                bot_uid = get_bot_user_id()
-                if bot_uid and f"<@{bot_uid}>" in text_ev:
-                    threading.Thread(target=_handle_app_mention, args=(event,), daemon=True).start()
-                    return Response("", status=200)
-
+            # Priority 1: replies in an active IT Help thread
             if thread_ts_event and thread_ts_event in active_threads:
-                threading.Thread(target=_handle_dm_reply, args=(event, thread_ts_event), daemon=True).start()
+                threading.Thread(target=_handle_thread_reply, args=(event, thread_ts_event), daemon=True).start()
+                return Response("", status=200)
 
-            elif channel_type == "im" and user_id_ev and dm_channel_ev:
-                active_ts = _active_thread_for_dm(dm_channel_ev, user_id_ev)
-                # User wrote in the DM *main* pane (or in some other thread): keep one coherent session
-                if active_ts and (not thread_ts_event or thread_ts_event != active_ts):
+            # Priority 2: bot @mention in a channel (fallback if app_mention event not configured)
+            bot_uid = get_bot_user_id()
+            if bot_uid and f"<@{bot_uid}>" in text_ev:
+                threading.Thread(target=_handle_app_mention, args=(event,), daemon=True).start()
+                return Response("", status=200)
+
+            # Priority 3: user typed in main channel box but has an active IT Help thread → route to it
+            if not thread_ts_event and channel_ev and user_ev:
+                active_ts = user_active_thread.get((channel_ev, user_ev))
+                if active_ts and active_ts in active_threads:
                     ev = dict(event)
                     ev["thread_ts"] = active_ts
-                    threading.Thread(target=_handle_dm_reply, args=(ev, active_ts), daemon=True).start()
-                else:
-                    threading.Thread(target=_handle_sidebar_message, args=(event,), daemon=True).start()
+                    threading.Thread(target=_handle_thread_reply, args=(ev, active_ts), daemon=True).start()
+                    return Response("", status=200)
 
     return Response("", status=200)
 
-def _handle_dm_reply(event, thread_ts):
+def _handle_thread_reply(event, thread_ts):
+    """Handle user replies in a channel thread with an active IT Help session."""
     try:
         conversation = active_threads[thread_ts]
-        dm_channel = conversation["dm_channel"]
+        channel = conversation["channel"]
         user_text = _strip_slack_mentions(event.get("text", "").strip())
         user_id = event.get("user")
 
+        if not user_text:
+            return
+
+        # If we were waiting for the initial query (empty @mention)
+        if conversation.get("awaiting_query"):
+            if _is_trivial_greeting(user_text):
+                slack_post_message(
+                    channel,
+                    "👋 Hi! I still need to know what's going wrong. Please describe your *work tech* issue "
+                    "(e.g. _'VPN not connecting on Mac'_ or _'Can't log into Gmail'_) and I'll help.",
+                    thread_ts=thread_ts,
+                )
+                return
+            conversation["awaiting_query"] = False
+            conversation["query"] = user_text
+            stop_spinner = start_live_spinner(channel, "Searching KB and preparing the best answer…", thread_ts=thread_ts)
+            try:
+                kb = search_confluence(user_text, 0)
+                if kb:
+                    _post_kb_in_thread(channel, user_id, user_text, kb, thread_ts)
+                else:
+                    start_ai_thread(channel, user_id, user_text, thread_ts)
+            finally:
+                stop_spinner()
+            return
+
         if user_text.lower() == "done":
-            slack_post_message(dm_channel, "✅ *Chat ended.* If you need help again, use `/it help <issue>` anytime!", thread_ts=thread_ts)
+            slack_post_message(channel, "✅ *Chat ended.* If you need help again, @mention IT Help in any channel!", thread_ts=thread_ts)
             _unbind_active_thread(thread_ts)
             return
 
         if user_text.lower() == "ticket":
+            user_name = get_slack_user_name(user_id)
             summary = _ticket_summary_from_history(conversation["history"])
-            desc = _ticket_description_transcript(conversation["history"], f"<@{user_id}>")
-            result = create_jira_ticket(summary, f"<@{user_id}>", description=desc)
-            slack_post_message(dm_channel, result, thread_ts=thread_ts)
-            slack_post_message(dm_channel, "Chat ended. The IT team will follow up on your ticket.", thread_ts=thread_ts)
+            desc = _ticket_description_transcript(conversation["history"], user_name)
+            result = create_jira_ticket(summary, user_name, description=desc)
+            slack_post_message(channel, result, thread_ts=thread_ts)
+            slack_post_message(channel, "Chat ended. The IT team will follow up on your ticket.", thread_ts=thread_ts)
             _unbind_active_thread(thread_ts)
             return
 
@@ -2107,10 +2046,11 @@ def _handle_dm_reply(event, thread_ts):
             ai_response = engineer_feedback_reply(user_text, snippets)
             conversation["history"].append({"role": "user", "parts": [{"text": user_text}]})
             conversation["history"].append({"role": "model", "parts": [{"text": ai_response}]})
-            slack_post_message(dm_channel, slack_format(ai_response), thread_ts=thread_ts)
+            slack_post_message(channel, slack_format(ai_response), thread_ts=thread_ts)
+            _post_ai_followup(channel, thread_ts, conversation.get("query", ""), conversation["history"])
             return
 
-        stop_spinner = start_live_spinner(dm_channel, "Analyzing your message and preparing next checks…", thread_ts=thread_ts)
+        stop_spinner = start_live_spinner(channel, "Analyzing your message and preparing next checks…", thread_ts=thread_ts)
         try:
             conversation["history"].append({"role": "user", "parts": [{"text": user_text}]})
             ai_response = ask_ai_with_history(
@@ -2122,202 +2062,87 @@ def _handle_dm_reply(event, thread_ts):
         finally:
             stop_spinner()
 
-        slack_post_message(dm_channel, ai_slack, thread_ts=thread_ts)
+        slack_post_message(channel, ai_slack, thread_ts=thread_ts)
+        _post_ai_followup(channel, thread_ts, conversation.get("query", ""), conversation["history"])
 
     except Exception as exc:
-        print(f"[DEBUG] _handle_dm_reply ERROR: {exc}")
-        dm_channel = active_threads.get(thread_ts, {}).get("dm_channel")
-        if dm_channel:
-            slack_post_message(
-                dm_channel,
-                _api_error_user_message(exc),
-                thread_ts=thread_ts,
-            )
+        print(f"[DEBUG] _handle_thread_reply ERROR: {exc}")
+        ch = active_threads.get(thread_ts, {}).get("channel")
+        if ch:
+            slack_post_message(ch, _api_error_user_message(exc), thread_ts=thread_ts)
 
 def _strip_slack_mentions(text):
-    """Remove Slack <@U…> tokens so @-invokes don’t confuse intent or search."""
+    """Remove Slack <@U…> tokens so @-invokes don't confuse intent or search."""
     if not text:
         return ""
     return re.sub(r"<@[^>]+>\s*", "", text).strip()
 
 
+_GREETING_PATTERN = re.compile(
+    r"^(hi+|hello+|hey+|yo|sup|howdy|hiya|"
+    r"good\s+(morning|afternoon|evening)|"
+    r"thanks?|thank\s+you|ty|thx|"
+    r"bye+|cya|later|cheers|"
+    r"ok+ay?|okay|okey|cool|nice|"
+    r"test|testing|ping|"
+    r"help|help\s+me|need\s+help|need\s+some\s+help)"
+    r"[\s,!.?\-]*$",
+    re.I,
+)
+
+
+def _is_trivial_greeting(text):
+    """Detect short greetings / filler where we should ask for the actual issue."""
+    if not text:
+        return True
+    t = text.strip()
+    if len(t) < 3:
+        return True
+    if _GREETING_PATTERN.match(t):
+        return True
+    return False
+
+
 def _handle_app_mention(event):
-    """@IT Help in a channel → ephemeral note + same flow as sidebar DM."""
+    """@IT Help in a channel → reply in thread → KB search or AI chat in the same thread."""
     try:
         user_id = event.get("user")
         channel = event.get("channel")
         mention_ts = event.get("ts")
-        if not user_id:
+        if not user_id or not channel:
             return
 
         cleaned = _strip_slack_mentions(event.get("text", ""))
+        query = cleaned.strip() if cleaned else ""
 
-        if channel and not str(channel).startswith("D"):
-            # Public acknowledgement so the user sees immediate response in-channel.
+        if _is_trivial_greeting(query):
             slack_post_message(
                 channel,
-                f"👋 <@{user_id}> I’m on it — moving this to DM for private troubleshooting.",
+                f"👋 <@{user_id}> Hi! What's going wrong with your *work tech* (VPN, email, laptop, access, software)?\n\n"
+                "🧵 *Please reply in this thread* (click *Reply* below or open the thread) with your issue and I'll help.",
                 thread_ts=mention_ts,
             )
-            slack_post_ephemeral(
-                channel,
-                user_id,
-                "👋 *IT Help* — I’ve moved this to our *private DM* so nothing sensitive sits in the channel. "
-                "Check your DM with this app in a moment.",
-            )
-            dm_channel = open_dm(user_id)
-            if not dm_channel:
-                slack_post_message(
-                    channel,
-                    f"⚠️ <@{user_id}> I couldn’t open DM right now. Please message me directly in *Messages* tab.",
-                    thread_ts=mention_ts,
-                )
-                return
-        else:
-            dm_channel = channel
-
-        if not dm_channel:
+            # Register thread so replies are caught
+            _bind_thread(mention_ts, {
+                "channel": channel,
+                "user_id": user_id,
+                "query": "",
+                "next_index": 0,
+                "history": [],
+                "awaiting_query": True,
+            })
             return
 
-        synthetic = {
-            "channel": dm_channel,
-            "user": user_id,
-            "text": cleaned if cleaned else "hi",
-            "thread_ts": None,
-        }
-        _handle_sidebar_message(synthetic)
+        stop_spinner = start_live_spinner(channel, "Searching KB and preparing the best answer…", thread_ts=mention_ts)
+        try:
+            kb = search_confluence(query, 0)
+            if kb:
+                _post_kb_in_thread(channel, user_id, query, kb, mention_ts)
+            else:
+                start_ai_thread(channel, user_id, query, mention_ts)
+        finally:
+            stop_spinner()
     except Exception as e:
         print(f"[DEBUG] _handle_app_mention ERROR: {e}")
 
 
-# Top-level DM “memory” for short social replies (threaded KB+AI uses active_threads)
-DM_CONVERSATIONS = {}
-
-_SIDEBAR_ENGINEER_PROMPT = (
-    "You are a *senior internal IT support engineer* chatting in Slack DM with an employee.\n\n"
-    "STYLE:\n"
-    "- Sound like a real engineer: clear, direct, respectful — not a generic chatbot.\n"
-    "- Prefer *structured* answers: short opening → numbered checks → what info you need next.\n"
-    "- Ask sharp clarifying questions when the report is vague (*OS*, exact symptom, error text, VPN on/off, wired vs Wi‑Fi).\n"
-    "- If they only said hello/thanks, keep it brief and route them toward describing a work-tech problem.\n\n"
-    "SECURITY:\n"
-    "- No admin/registry/terminal/PowerShell/sudo/BIOS/policy-bypass steps.\n"
-    "- Never tell them to disable antivirus, firewall, MDM, or company security tooling.\n"
-    "- If it needs elevated access: tell them to type `ticket` for Jira / IT.\n\n"
-    "FORMAT: Slack mrkdwn — *bold* only; numbered lists OK; no ## or **; no tables."
-)
-
-
-def _handle_sidebar_message(event):
-    try:
-        user_id = event.get("user")
-        user_text = _strip_slack_mentions(event.get("text", "").strip())
-        dm_channel = event.get("channel")
-
-        if not user_text or not user_id:
-            return
-
-        intent = classify_sidebar_message(user_text)
-
-        if intent == "TICKET_CMD":
-            slack_post_message(
-                dm_channel,
-                "I don’t have an *open* troubleshooting thread here yet. "
-                "Describe the issue in one message (or reply inside the thread under the last article), "
-                "then type `ticket` again. You can also use `/it jira <short summary>` anytime.",
-            )
-            return
-
-        if intent == "DONE_CMD":
-            slack_post_message(
-                dm_channel,
-                "There’s no active session to close. Send *hi* or describe an issue whenever you need IT.",
-            )
-            return
-        print(f"[DEBUG] Sidebar intent: {intent} text={user_text[:80]!r}")
-
-        if intent == "GREETING":
-            reply = engineer_smalltalk_reply(user_text)
-            slack_post_message(dm_channel, slack_format(reply))
-            return
-
-        if intent == "FEEDBACK":
-            if dm_channel not in DM_CONVERSATIONS:
-                DM_CONVERSATIONS[dm_channel] = []
-            snippets = []
-            for m in DM_CONVERSATIONS[dm_channel][-8:]:
-                role = "User" if m["role"] == "user" else "IT"
-                snippets.append(f"{role}: {m['parts'][0]['text'][:400]}")
-            reply = engineer_feedback_reply(user_text, snippets)
-            slack_post_message(dm_channel, slack_format(reply))
-            DM_CONVERSATIONS[dm_channel].append({"role": "user", "parts": [{"text": user_text}]})
-            DM_CONVERSATIONS[dm_channel].append({"role": "model", "parts": [{"text": reply}]})
-            return
-
-        if intent == "IT_ISSUE":
-            DM_CONVERSATIONS[dm_channel] = []
-            _discard_dm_session_for_channel(dm_channel)
-            stop_spinner = start_live_spinner(dm_channel, "Searching KB and preparing the best answer…")
-            try:
-                kb = search_confluence(user_text, 0)
-                if kb:
-                    _post_kb_thread_and_register(dm_channel, user_id, user_text, kb, user_text)
-                else:
-                    slack_post_message(
-                        dm_channel,
-                        "_No reliable KB match found — I’m opening a focused AI troubleshooting thread now._",
-                    )
-                    start_ai_dm_thread(user_text, user_id)
-            finally:
-                stop_spinner()
-            return
-
-        if intent == "UNCLEAR":
-            slack_post_message(
-                dm_channel,
-                "I didn’t quite catch that — what’s going wrong with your *work tech* (one sentence is fine)?",
-            )
-            return
-
-        # Fallback: engineer chat with light history
-        if dm_channel not in DM_CONVERSATIONS:
-            DM_CONVERSATIONS[dm_channel] = []
-        history = DM_CONVERSATIONS[dm_channel]
-        history.append({"role": "user", "parts": [{"text": user_text}]})
-
-        trimmed = trim_history(history)
-        if AI_KB_GROUNDING_ENABLED:
-            use_kb, kb_body = _retrieve_kb_grounding_payload(user_text)
-            if use_kb:
-                sys_prompt = (
-                    _SIDEBAR_ENGINEER_PROMPT
-                    + CHAT_KB_GROUNDING_APPEND
-                    + "\n\n"
-                    + _format_kb_excerpts_positive_block(kb_body)
-                )
-            else:
-                sys_prompt = _SIDEBAR_ENGINEER_PROMPT + CHAT_GENERAL_NO_KB_APPEND
-        else:
-            sys_prompt = _SIDEBAR_ENGINEER_PROMPT
-        contents = [
-            {"role": "user", "parts": [{"text": sys_prompt}]},
-            {"role": "model", "parts": [{"text": "Understood — triaging like a service desk engineer."}]},
-        ]
-        contents.extend(trimmed)
-
-        ai_reply = gemini_generate(
-            contents=contents,
-            generation_config={"temperature": 0.3, "maxOutputTokens": 1600},
-            timeout=(10, 60),
-            retries=2,
-        )
-        ai_reply = enforce_security_policy(ai_reply)
-        ai_slack = slack_format(ai_reply)
-        history.append({"role": "model", "parts": [{"text": ai_reply}]})
-        slack_post_message(dm_channel, ai_slack)
-
-    except Exception as exc:
-        print(f"[DEBUG] _handle_sidebar_message ERROR: {exc}")
-        dm_channel = event.get("channel")
-        if dm_channel:
-            slack_post_message(dm_channel, _api_error_user_message(exc))
