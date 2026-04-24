@@ -1,6 +1,6 @@
 # IT Help — Slack Bot
 
-A Flask-based Slack bot that acts as a senior L2 IT support engineer. When an
+A Flask-based Slack bot that acts as a senior L1 IT support engineer. When an
 employee `@mentions` the bot in a channel (or replies in a live thread), it
 searches the internal Confluence knowledge base, summarizes the best article
 with Google Gemini, chats back-and-forth in the same thread, and — if the issue
