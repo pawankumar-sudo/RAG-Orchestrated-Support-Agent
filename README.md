@@ -31,8 +31,6 @@ private IT channel.
 - **Security policy enforcement**
   - Admin-only steps (registry edits, PowerShell, `sudo`, BIOS, GPO, disabling
     AV/firewall, etc.) are redacted and replaced with a ticket placeholder.
-  - Citation tokens (`KB[1]`, `[4]`, `(source: 2)`) are stripped from model
-    output.
 - **Live spinner** — rotating Braille frames update a Slack message while the
   bot is working.
 - **Interactive Block Kit buttons**
